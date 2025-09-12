@@ -5,7 +5,6 @@ import com.techcourse.exception.UncheckedServletException;
 import com.techcourse.model.User;
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.Socket;
@@ -15,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 public class Http11Processor implements Runnable, Processor {
 
     private static final Logger log = LoggerFactory.getLogger(Http11Processor.class);
+    private static final SessionManager SESSION_MANAGER = new SessionManager();
 
     private final Socket connection;
 
@@ -41,54 +42,119 @@ public class Http11Processor implements Runnable, Processor {
     @Override
     public void process(final Socket connection) {
         try (final var inputStream = connection.getInputStream();
-             final var outputStream = connection.getOutputStream()) {
+             final var outputStream = connection.getOutputStream();
+             final var bufferedReader = new BufferedReader(new InputStreamReader(inputStream))) {
 
-            Map<String, String> httpRequest = readHttpRequest(inputStream);
+            Map<String, String> httpRequest = readHttpRequest(bufferedReader);
             if (httpRequest.isEmpty()) {
                 return;
             }
 
-            Map<String, String> queryParameters = extractQueryParameters(httpRequest);
             String uri = httpRequest.get("Uri");
-            if("/login".equals(uri) && !queryParameters.isEmpty()){
-                login(queryParameters, outputStream);
+            String method = httpRequest.get("Method");
+            List<Cookie> cookies = extractCookies(httpRequest);
+            Session session = getSession(cookies);
+
+            if("GET".equals(method)){
+                if("/login".equals(uri) && session != null){
+                    responseFound("/index.html", List.of(), outputStream);
+                    return;
+                }
+
+                Path resourcePath = findResourcePath(uri, outputStream);
+                if (resourcePath == null) {
+                    return;
+                }
+
+                responseOk(resourcePath, outputStream);
                 return;
             }
 
-            Path resourcePath = findResourcePath(uri, outputStream);
-            if (resourcePath == null) {
-                return;
+            if("POST".equals(method)){
+                String requestBody = httpRequest.get("Body");
+                if("/login".equals(uri)){
+                    login(requestBody, outputStream);
+                    return;
+                }
+                if("/register".equals(uri)){
+                    register(requestBody, outputStream);
+                    return;
+                }
             }
 
-            String responseBody = readResponseBody(resourcePath);
-            String contentType = Files.probeContentType(resourcePath);
-            String httpResponse = createHttpResponse(contentType, responseBody);
 
-            outputStream.write(httpResponse.getBytes());
-            outputStream.flush();
         } catch (IOException | UncheckedServletException | URISyntaxException e) {
             log.error(e.getMessage(), e);
         }
     }
 
-    private Map<String, String> readHttpRequest(InputStream inputStream) throws IOException {
-        BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(inputStream));
-        Map<String, String> values = new HashMap<>();
+    private static Session getSession(List<Cookie> cookies) throws IOException {
+        List<String> sessionIdTexts = cookies.stream()
+                .filter(cookie -> "JSESSIONID".equals(cookie.getName()))
+                .map(Cookie::getValue)
+                .toList();
+        Session session = null;
+        if(!sessionIdTexts.isEmpty()){
+            session = SESSION_MANAGER.findSession(sessionIdTexts.getFirst());
+        }
+
+        return session;
+    }
+
+    private List<Cookie> extractCookies(Map<String, String> httpRequest) {
+        String cookie = httpRequest.get("Cookie");
+        if(cookie == null){
+            return List.of();
+        }
+
+        return Arrays.stream(cookie.split("; "))
+                .map(c -> c.split("="))
+                .map(c -> new Cookie(c[0], c[1]))
+                .toList();
+    }
+
+    private void register(String requestBody, OutputStream outputStream) throws IOException, URISyntaxException {
+        String[] body = requestBody.split("&");
+        String account = body[0].split("=")[1];
+        String email = body[1].split("=")[1];
+        String password = body[2].split("=")[1];
+
+        if(InMemoryUserRepository.findByAccount(account).isPresent()){
+            outputStream.write("HTTP/1.1 409 CONFLICT \r\n\r\n".getBytes());
+            outputStream.flush();
+            return;
+        }
+        User user = new User(account, password, email);
+        InMemoryUserRepository.save(user);
+
+        responseFound("/index.html", List.of(), outputStream);
+    }
+
+    private void responseOk(Path resourcePath, OutputStream outputStream) throws IOException {
+        String responseBody = readResponseBody(resourcePath);
+        String contentType = Files.probeContentType(resourcePath);
+        String httpResponse = createHttpResponse(200, "OK" ,List.of(), contentType, responseBody);
+        outputStream.write(httpResponse.getBytes());
+        outputStream.flush();
+    }
+
+    private Map<String, String> readHttpRequest(BufferedReader bufferedReader) throws IOException {
+        Map<String, String> httpRequest = new HashMap<>();
 
         String firstLine = bufferedReader.readLine();
-        if(firstLine == null) return values;
+        if(firstLine == null) return httpRequest;
 
         String[] requestLine = firstLine.split(" ");
 
-        if(requestLine.length < 3) return values;
-        values.put("Method", requestLine[0]);
-        values.put("Uri", requestLine[1]);
-        values.put("Version", requestLine[2]);
+        if(requestLine.length < 3) return httpRequest;
+        httpRequest.put("Method", requestLine[0]);
+        httpRequest.put("Uri", requestLine[1]);
+        httpRequest.put("Version", requestLine[2]);
 
         int queryParameterIndex = requestLine[1].indexOf("?");
         if(queryParameterIndex != -1){
-            values.put("Uri", requestLine[1].substring(0, queryParameterIndex));
-            values.put("QueryParameters", requestLine[1].substring(queryParameterIndex + 1, requestLine[1].length()));
+            httpRequest.put("Uri", requestLine[1].substring(0, queryParameterIndex));
+            httpRequest.put("QueryParameters", requestLine[1].substring(queryParameterIndex + 1, requestLine[1].length()));
         }
 
 
@@ -99,46 +165,60 @@ public class Http11Processor implements Runnable, Processor {
                 return Map.of();
             }
 
-            values.put(header[0], header[1]);
+            httpRequest.put(header[0], header[1]);
             line = bufferedReader.readLine();
         }
 
-        return values;
-    }
+        if(httpRequest.containsKey("Content-Length")){
+            int contentLength = Integer.parseInt(httpRequest.get("Content-Length"));
+            char[] body = new char[contentLength];
+            bufferedReader.read(body);
 
-    private Map<String, String> extractQueryParameters(Map<String, String> httpRequest) {
-        if (!httpRequest.containsKey("QueryParameters")) {
-            return Map.of();
+            httpRequest.put("Body", String.valueOf(body));
         }
 
-        String queryParameterTexts = httpRequest.get("QueryParameters");
-        return Arrays.stream(queryParameterTexts.split("&"))
-                .map(queryParameterText -> queryParameterText.split("="))
-                .collect(Collectors.toMap(
-                        keyAndValue -> keyAndValue[0],
-                        keyAndValue -> keyAndValue[1]
-                ));
+        return httpRequest;
     }
 
-    private void login(Map<String, String> queryParameters, OutputStream outputStream) throws IOException {
-        String account = queryParameters.getOrDefault("account", "");
-        String password = queryParameters.getOrDefault("password", "");
+    private void login(String requestBody, OutputStream outputStream)
+            throws IOException, URISyntaxException {
+        if(requestBody == null){
+            return;
+        }
+
+        String[] body = requestBody.split("&");
+        String account = body[0].split("=")[1];
+        String password = body[1].split("=")[1];
 
         Optional<User> optionalUser = InMemoryUserRepository.findByAccount(account);
         if(optionalUser.isEmpty()){
-            outputStream.write("HTTP/1.1 401 UNAUTHORIZED \r\n\r\n".getBytes());
-            outputStream.flush();
+            responseFound("/401.html", List.of(), outputStream);
             return;
         }
 
         User user = optionalUser.get();
         if(!user.checkPassword(password)){
-            outputStream.write("HTTP/1.1 401 UNAUTHORIZED \r\n\r\n".getBytes());
-            outputStream.flush();
+            responseFound("/401.html", List.of(), outputStream);
             return;
         }
 
-        log.info("user: {}", user);
+        String sessionName = "JSESSIONID";
+        Session newSession = SESSION_MANAGER.createSession();
+        SESSION_MANAGER.add(newSession);
+        Cookie cookie = new Cookie(sessionName, newSession.getId());
+        String cookieHeader = "Set-Cookie: " + cookie.getName() + "=" + cookie.getValue();
+        List<String> headers = List.of(cookieHeader);
+
+        responseFound("/index.html", headers, outputStream);
+    }
+
+    private void responseFound(String uri, List<String> headers, OutputStream outputStream) throws IOException, URISyntaxException {
+        Path resourcePath = findResourcePath(uri, outputStream);
+        String contentType = Files.probeContentType(resourcePath);
+        String responseBody = readResponseBody(resourcePath);
+        String httpResponse = createHttpResponse(302, "FOUND", headers, contentType, responseBody);
+        outputStream.write(httpResponse.getBytes());
+        outputStream.flush();
     }
 
     private Path findResourcePath(String uri, OutputStream outputStream) throws IOException, URISyntaxException {
@@ -194,12 +274,25 @@ public class Http11Processor implements Runnable, Processor {
         return String.join("\n", Files.readAllLines(resourcePath)) + "\n";
     }
 
-    private String createHttpResponse(String contentType, String responseBody) {
+    private String createHttpResponse(int statusCode, String statusMessage, List<String> headers, String contentType, String responseBody) {
+        if(headers.isEmpty()){
+            return String.join(
+                    "\r\n",
+                    "HTTP/1.1 "+ statusCode + " " + statusMessage,
+                    "Content-Type: "+ contentType +";charset=utf-8 ",
+                    "Content-Length: " + responseBody.getBytes().length + " ",
+                    "",
+                    responseBody
+            );
+        }
+
+        String headerTexts = headers.stream().collect(Collectors.joining("\r\n"));
         return String.join(
                 "\r\n",
-                "HTTP/1.1 200 OK ",
+                "HTTP/1.1 "+ statusCode + " " + statusMessage,
                 "Content-Type: "+ contentType +";charset=utf-8 ",
                 "Content-Length: " + responseBody.getBytes().length + " ",
+                headerTexts,
                 "",
                 responseBody
         );
