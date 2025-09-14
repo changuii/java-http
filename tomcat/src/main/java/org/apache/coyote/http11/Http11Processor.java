@@ -6,7 +6,6 @@ import com.techcourse.model.User;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.Socket;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -15,7 +14,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;
 import org.apache.coyote.Processor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,6 +22,7 @@ public class Http11Processor implements Runnable, Processor {
 
     private static final Logger log = LoggerFactory.getLogger(Http11Processor.class);
     private static final SessionManager SESSION_MANAGER = new SessionManager();
+    private static final String HTTP_VERSION = "1.1";
 
     private final Socket connection;
 
@@ -44,41 +43,48 @@ public class Http11Processor implements Runnable, Processor {
              final var bufferedReader = new BufferedReader(new InputStreamReader(inputStream))) {
 
             HttpRequest request = new HttpRequest(bufferedReader);
-            Session session = getSession(request);
+            HttpResponse response = new HttpResponse(outputStream);
+            response.setVersion(HTTP_VERSION);
 
-            if(request.isGet()){
-                if(request.equalsUri("/login") && session != null){
-                    responseFound("/index.html", List.of(), outputStream);
-                    return;
-                }
+            handle(request, response);
 
-                Path resourcePath = findResourcePath(request.getUri(), outputStream);
-                if (resourcePath == null) {
-                    return;
-                }
-
-                responseOk(resourcePath, outputStream);
-                return;
-            }
-
-            if(request.isPost()){
-                if(request.equalsUri("/login")){
-                    login(request, outputStream);
-                    return;
-                }
-                if(request.equalsUri("/register")){
-                    register(request, outputStream);
-                    return;
-                }
-            }
-
+            response.response();
 
         } catch (IOException | UncheckedServletException | URISyntaxException e) {
             log.error(e.getMessage(), e);
         }
     }
 
-    private static Session getSession(HttpRequest request) {
+    private void handle(HttpRequest request, HttpResponse response) throws IOException, URISyntaxException {
+        Session session = getSession(request);
+        if (request.isGet()) {
+            if (request.equalsUri("/login") && session != null) {
+                responseFound("/index.html", List.of(), response);
+                return;
+            }
+
+            Path resourcePath = findResourcePath(request.getUri(), response);
+            if (resourcePath == null) {
+                return;
+            }
+
+            responseOk(resourcePath, response);
+            return;
+        }
+
+        if (request.isPost()) {
+            if (request.equalsUri("/login")) {
+                login(request, response);
+                return;
+            }
+            if (request.equalsUri("/register")) {
+                register(request, response);
+                return;
+            }
+        }
+    }
+
+    private Session getSession(HttpRequest request) {
         if(!request.containsSessionId()){
             return null;
         }
@@ -87,32 +93,32 @@ public class Http11Processor implements Runnable, Processor {
         return SESSION_MANAGER.findSession(sessionId);
     }
 
-    private void register(HttpRequest request, OutputStream outputStream) throws IOException, URISyntaxException {
+    private void register(HttpRequest request, HttpResponse response) throws IOException, URISyntaxException {
         Map<String, String> body = request.getBody();
         String account = body.get("account");
         String email = body.get("email");
         String password = body.get("password");
 
         if(InMemoryUserRepository.findByAccount(account).isPresent()){
-            outputStream.write("HTTP/1.1 409 CONFLICT \r\n\r\n".getBytes());
-            outputStream.flush();
+            response.setHttpStatusCode(HttpStatus.CONFLICT);
             return;
         }
         User user = new User(account, password, email);
         InMemoryUserRepository.save(user);
 
-        responseFound("/index.html", List.of(), outputStream);
+        responseFound("/index.html", List.of(), response);
     }
 
-    private void responseOk(Path resourcePath, OutputStream outputStream) throws IOException {
+    private void responseOk(Path resourcePath, HttpResponse response) throws IOException {
         String responseBody = readResponseBody(resourcePath);
         String contentType = Files.probeContentType(resourcePath);
-        String httpResponse = createHttpResponse(200, "OK" ,List.of(), contentType, responseBody);
-        outputStream.write(httpResponse.getBytes());
-        outputStream.flush();
+
+        response.setHttpStatusCode(HttpStatus.OK);
+        response.setHeader("Content-Type", contentType);
+        response.setBody(responseBody);
     }
 
-    private void login(HttpRequest request, OutputStream outputStream)
+    private void login(HttpRequest request, HttpResponse response)
             throws IOException, URISyntaxException {
         Map<String, String> body = request.getBody();
         String account = body.get("account");
@@ -120,13 +126,13 @@ public class Http11Processor implements Runnable, Processor {
 
         Optional<User> optionalUser = InMemoryUserRepository.findByAccount(account);
         if(optionalUser.isEmpty()){
-            responseFound("/401.html", List.of(), outputStream);
+            responseFound("/401.html", List.of(), response);
             return;
         }
 
         User user = optionalUser.get();
         if(!user.checkPassword(password)){
-            responseFound("/401.html", List.of(), outputStream);
+            responseFound("/401.html", List.of(), response);
             return;
         }
 
@@ -137,39 +143,45 @@ public class Http11Processor implements Runnable, Processor {
         String cookieHeader = "Set-Cookie: " + cookie.getName() + "=" + cookie.getValue();
         List<String> headers = List.of(cookieHeader);
 
-        responseFound("/index.html", headers, outputStream);
+        responseFound("/index.html", headers, response);
     }
 
-    private void responseFound(String uri, List<String> headers, OutputStream outputStream) throws IOException, URISyntaxException {
-        Path resourcePath = findResourcePath(uri, outputStream);
+    private void responseFound(String uri, List<String> headers, HttpResponse response)
+            throws IOException, URISyntaxException {
+        Path resourcePath = findResourcePath(uri, response);
+        if (resourcePath == null) {
+            return;
+        }
+
         String contentType = Files.probeContentType(resourcePath);
         String responseBody = readResponseBody(resourcePath);
-        String httpResponse = createHttpResponse(302, "FOUND", headers, contentType, responseBody);
-        outputStream.write(httpResponse.getBytes());
-        outputStream.flush();
+
+        response.setHttpStatusCode(HttpStatus.FOUND);
+        response.setHeader("Content-Type", contentType);
+        response.setHeaders(headers);
+        response.setBody(responseBody);
     }
 
-    private Path findResourcePath(String uri, OutputStream outputStream) throws IOException, URISyntaxException {
+    private Path findResourcePath(String uri, HttpResponse response) throws URISyntaxException {
         URL url = findResourceURL(uri);
         if(url == null){
-            String helloWorldHttpResponse = helloWorldHttpResponse();
-            outputStream.write(helloWorldHttpResponse.getBytes());
-            outputStream.flush();
+            response.setBody("Hello World!");
+            response.setHttpStatusCode(HttpStatus.OK);
+            response.setHeader("Content-Type", "text/html;charset=utf-8");
             return null;
         }
 
         Path resourcePath = Path.of(url.toURI());
         Path normalizedResourcePath = resourcePath.normalize();
         if(!normalizedResourcePath.startsWith("/")){
-            outputStream.write("HTTP/1.1 401 UNAUTHORIZED \r\n\r\n".getBytes());
-            outputStream.flush();
+            response.setHttpStatusCode(HttpStatus.UNAUTHORIZED);
             return null;
         }
 
         if(!Files.isRegularFile(normalizedResourcePath)){
-            String helloWorldHttpResponse = helloWorldHttpResponse();
-            outputStream.write(helloWorldHttpResponse.getBytes());
-            outputStream.flush();
+            response.setBody("Hello World!");
+            response.setHttpStatusCode(HttpStatus.OK);
+            response.setHeader("Content-Type", "text/html;charset=utf-8");
             return null;
         }
 
@@ -187,42 +199,7 @@ public class Http11Processor implements Runnable, Processor {
         return url;
     }
 
-    private String helloWorldHttpResponse() {
-        return String.join(
-                "\r\n",
-                "HTTP/1.1 200 OK ",
-                "Content-Type: text/html;charset=utf-8 ",
-                "Content-Length: 12 ",
-                "",
-                "Hello world!"
-        );
-    }
-
     private String readResponseBody(Path resourcePath) throws IOException {
         return String.join("\n", Files.readAllLines(resourcePath)) + "\n";
-    }
-
-    private String createHttpResponse(int statusCode, String statusMessage, List<String> headers, String contentType, String responseBody) {
-        if(headers.isEmpty()){
-            return String.join(
-                    "\r\n",
-                    "HTTP/1.1 "+ statusCode + " " + statusMessage,
-                    "Content-Type: "+ contentType +";charset=utf-8 ",
-                    "Content-Length: " + responseBody.getBytes().length + " ",
-                    "",
-                    responseBody
-            );
-        }
-
-        String headerTexts = headers.stream().collect(Collectors.joining("\r\n"));
-        return String.join(
-                "\r\n",
-                "HTTP/1.1 "+ statusCode + " " + statusMessage,
-                "Content-Type: "+ contentType +";charset=utf-8 ",
-                "Content-Length: " + responseBody.getBytes().length + " ",
-                headerTexts,
-                "",
-                responseBody
-        );
     }
 }
