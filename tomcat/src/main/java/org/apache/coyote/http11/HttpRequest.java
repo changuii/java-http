@@ -6,6 +6,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.apache.coyote.http11.cookie.Cookie;
+import org.apache.coyote.http11.session.Session;
 
 public class HttpRequest {
 
@@ -30,6 +32,7 @@ public class HttpRequest {
     private final Map<String, String> headers = new HashMap<>();
     private final Map<String, Cookie> cookies = new HashMap<>();
     private String body;
+    private Session session;
 
     public HttpRequest(final BufferedReader reader) throws IOException {
         readRequestLine(reader);
@@ -82,6 +85,10 @@ public class HttpRequest {
         }
     }
 
+    public void setSession(Session session) {
+        this.session = session;
+    }
+
     public boolean containsSessionId(){
         return cookies.containsKey("JSESSIONID");
     }
@@ -107,6 +114,10 @@ public class HttpRequest {
 
     public boolean isPost(){
         return "POST".equals(method);
+    }
+
+    public Session getSession() {
+        return session;
     }
 
     public Map<String, String> getBody() {
