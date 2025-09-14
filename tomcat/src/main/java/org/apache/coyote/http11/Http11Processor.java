@@ -12,8 +12,6 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,23 +43,16 @@ public class Http11Processor implements Runnable, Processor {
              final var outputStream = connection.getOutputStream();
              final var bufferedReader = new BufferedReader(new InputStreamReader(inputStream))) {
 
-            Map<String, String> httpRequest = readHttpRequest(bufferedReader);
-            if (httpRequest.isEmpty()) {
-                return;
-            }
+            HttpRequest request = new HttpRequest(bufferedReader);
+            Session session = getSession(request);
 
-            String uri = httpRequest.get("Uri");
-            String method = httpRequest.get("Method");
-            List<Cookie> cookies = extractCookies(httpRequest);
-            Session session = getSession(cookies);
-
-            if("GET".equals(method)){
-                if("/login".equals(uri) && session != null){
+            if(request.isGet()){
+                if(request.equalsUri("/login") && session != null){
                     responseFound("/index.html", List.of(), outputStream);
                     return;
                 }
 
-                Path resourcePath = findResourcePath(uri, outputStream);
+                Path resourcePath = findResourcePath(request.getUri(), outputStream);
                 if (resourcePath == null) {
                     return;
                 }
@@ -70,14 +61,13 @@ public class Http11Processor implements Runnable, Processor {
                 return;
             }
 
-            if("POST".equals(method)){
-                String requestBody = httpRequest.get("Body");
-                if("/login".equals(uri)){
-                    login(requestBody, outputStream);
+            if(request.isPost()){
+                if(request.equalsUri("/login")){
+                    login(request, outputStream);
                     return;
                 }
-                if("/register".equals(uri)){
-                    register(requestBody, outputStream);
+                if(request.equalsUri("/register")){
+                    register(request, outputStream);
                     return;
                 }
             }
@@ -88,36 +78,20 @@ public class Http11Processor implements Runnable, Processor {
         }
     }
 
-    private static Session getSession(List<Cookie> cookies) throws IOException {
-        List<String> sessionIdTexts = cookies.stream()
-                .filter(cookie -> "JSESSIONID".equals(cookie.getName()))
-                .map(Cookie::getValue)
-                .toList();
-        Session session = null;
-        if(!sessionIdTexts.isEmpty()){
-            session = SESSION_MANAGER.findSession(sessionIdTexts.getFirst());
+    private static Session getSession(HttpRequest request) {
+        if(!request.containsSessionId()){
+            return null;
         }
 
-        return session;
+        String sessionId = request.getSessionId();
+        return SESSION_MANAGER.findSession(sessionId);
     }
 
-    private List<Cookie> extractCookies(Map<String, String> httpRequest) {
-        String cookie = httpRequest.get("Cookie");
-        if(cookie == null){
-            return List.of();
-        }
-
-        return Arrays.stream(cookie.split("; "))
-                .map(c -> c.split("="))
-                .map(c -> new Cookie(c[0], c[1]))
-                .toList();
-    }
-
-    private void register(String requestBody, OutputStream outputStream) throws IOException, URISyntaxException {
-        String[] body = requestBody.split("&");
-        String account = body[0].split("=")[1];
-        String email = body[1].split("=")[1];
-        String password = body[2].split("=")[1];
+    private void register(HttpRequest request, OutputStream outputStream) throws IOException, URISyntaxException {
+        Map<String, String> body = request.getBody();
+        String account = body.get("account");
+        String email = body.get("email");
+        String password = body.get("password");
 
         if(InMemoryUserRepository.findByAccount(account).isPresent()){
             outputStream.write("HTTP/1.1 409 CONFLICT \r\n\r\n".getBytes());
@@ -138,57 +112,11 @@ public class Http11Processor implements Runnable, Processor {
         outputStream.flush();
     }
 
-    private Map<String, String> readHttpRequest(BufferedReader bufferedReader) throws IOException {
-        Map<String, String> httpRequest = new HashMap<>();
-
-        String firstLine = bufferedReader.readLine();
-        if(firstLine == null) return httpRequest;
-
-        String[] requestLine = firstLine.split(" ");
-
-        if(requestLine.length < 3) return httpRequest;
-        httpRequest.put("Method", requestLine[0]);
-        httpRequest.put("Uri", requestLine[1]);
-        httpRequest.put("Version", requestLine[2]);
-
-        int queryParameterIndex = requestLine[1].indexOf("?");
-        if(queryParameterIndex != -1){
-            httpRequest.put("Uri", requestLine[1].substring(0, queryParameterIndex));
-            httpRequest.put("QueryParameters", requestLine[1].substring(queryParameterIndex + 1, requestLine[1].length()));
-        }
-
-
-        String line = bufferedReader.readLine();
-        while (!"".equals(line)){
-            String[] header = line.split(": ");
-            if(header.length != 2){
-                return Map.of();
-            }
-
-            httpRequest.put(header[0], header[1]);
-            line = bufferedReader.readLine();
-        }
-
-        if(httpRequest.containsKey("Content-Length")){
-            int contentLength = Integer.parseInt(httpRequest.get("Content-Length"));
-            char[] body = new char[contentLength];
-            bufferedReader.read(body);
-
-            httpRequest.put("Body", String.valueOf(body));
-        }
-
-        return httpRequest;
-    }
-
-    private void login(String requestBody, OutputStream outputStream)
+    private void login(HttpRequest request, OutputStream outputStream)
             throws IOException, URISyntaxException {
-        if(requestBody == null){
-            return;
-        }
-
-        String[] body = requestBody.split("&");
-        String account = body[0].split("=")[1];
-        String password = body[1].split("=")[1];
+        Map<String, String> body = request.getBody();
+        String account = body.get("account");
+        String password = body.get("password");
 
         Optional<User> optionalUser = InMemoryUserRepository.findByAccount(account);
         if(optionalUser.isEmpty()){
