@@ -30,7 +30,6 @@ public class Http11Processor implements Runnable, Processor {
 
     @Override
     public void run() {
-        log.info("connect host: {}, port: {}", connection.getInetAddress(), connection.getPort());
 
         controllers.put("login", new LoginController());
         controllers.put("register", new RegisterController());
@@ -48,6 +47,7 @@ public class Http11Processor implements Runnable, Processor {
             HttpRequest request = new HttpRequest(bufferedReader);
             HttpResponse response = new HttpResponse(outputStream);
 
+            log.info("connect host: {}, port: {}, path:{}", connection.getInetAddress(), connection.getPort(), request.getUri());
             Session session = getSession(request);
             request.setSession(session);
             response.setVersion(HTTP_VERSION);
