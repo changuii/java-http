@@ -24,7 +24,7 @@ public class Connector implements Runnable {
     private static final int DEFAULT_WAITING_QUEUE_SIZE = 100;
 
     private final ServerSocket serverSocket;
-    private final ExecutorService threadPool;
+    private final ExecutorService executorService;
     private boolean stopped;
 
     public Connector() {
@@ -35,7 +35,7 @@ public class Connector implements Runnable {
     public Connector(final int port, final int acceptCount, final int maxThreads, final int coreThreads,
                      final long keepAliveTime, final int waitingQueueSize) {
         this.serverSocket = createServerSocket(port, acceptCount);
-        this.threadPool = new ThreadPoolExecutor(
+        this.executorService = new ThreadPoolExecutor(
                 coreThreads,
                 maxThreads,
                 keepAliveTime,
@@ -84,13 +84,16 @@ public class Connector implements Runnable {
             return;
         }
         var processor = new Http11Processor(connection);
-        threadPool.submit(processor);
+        executorService.submit(processor);
     }
 
     public void stop() {
         stopped = true;
         try {
             serverSocket.close();
+//            executorService.shutdown();
+            // close() 메서드 호출 시 shutdown 호출
+            executorService.close();
         } catch (IOException e) {
             log.error(e.getMessage(), e);
         }
